@@ -206,17 +206,7 @@ def temporal_market_buy(token_address, loop_count=1, amount=1_000_000, slippage=
             # Get Jupiter's instruction(s)
             print("🔄 Decoding Jupiter transaction...")
             swap_tx_data = base64.b64decode(tx_response['swapTransaction'])
-            jupiter_tx = VersionedTransaction.from_bytes(swap_tx_data)
-
-
-            jup_tx_message = jupiter_tx.message
-            tip_ix = transfer(TransferParams(from_pubkey=KEY.pubkey(), to_pubkey=NOZOMI_TIP, lamports=MIN_TIP_AMOUNT))
-            compiled_tip_ix = jup_tx_message.compile_instruction(tip_ix)
-            jup_tx_message.instructions.append(compiled_tip_ix)
-
-            ixs = jup_tx_message.instructions + [compiled_tip_ix]
-
-            rebuilt_tx = Message.new_with_compiled_instructions(jup_tx_message.)
+            jupiter_tx = VersionedTransaction.from_bytes(swap_tx_data) 
 
             print(f"📦 Jupiter transaction decoded, contains {len(jupiter_tx.message.instructions)} instructions")
 
