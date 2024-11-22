@@ -1,6 +1,6 @@
 # buysell_fast.py
 
-import requests
+from httpx import AsyncClient
 import json
 import base64
 import time
@@ -20,6 +20,15 @@ from solana.rpc.commitment import Commitment
 from solana.transaction import AccountMeta
 from solders.system_program import ID as SYS_PROGRAM_ID
 from solders.instruction import Instruction
+import dontshare as d
+import temporal_keys as tk
+import requests
+import json
+import base64
+from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
+from solders.message import MessageV0
+from solders.address_lookup_table_account import AddressLookupTableAccount
 
 # Constants
 LAMPORTS_PER_SOL = 1_000_000_000
@@ -28,6 +37,110 @@ MIN_TIP_AMOUNT = 1_000_000  # 0.001 SOL in lamports
 USDC_TOKEN = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 NOZOMI_TIP = Pubkey.from_string("9eja7sHKA3PhvcghxiMz9pCktgaYxDDopZYbZxscNsHG")
 NUM_ORDERS = 5  # 🌙 MoonDev's magic number - number of orders to place
+
+SWAP_IXS_URL = "https://quote-api.jup.ag/v6/swap-instructions"
+LOOKUP_ADDRESS_START_OFFSET = 56
+
+def load_address_lookup_tables(client: Client, addresses: list[Pubkey]) -> list[AddressLookupTableAccount]:
+    luts = []
+    accounts = client.get_multiple_accounts(addresses)
+    for account, address in zip(accounts.value, addresses):
+        data_len = len(account.data)
+        addresses = []
+        i = LOOKUP_ADDRESS_START_OFFSET
+        while i < data_len:
+            pubkey_start = i
+            pubkey = Pubkey.from_bytes(account.data[pubkey_start : pubkey_start+32])
+            addresses.append(pubkey)
+            i += 32
+        luts.append(AddressLookupTableAccount(address, addresses))
+    return luts
+
+
+
+def temporal_market_buy2(token_address, loop_count=1, amount=1_000_000, slippage=50, PRIORITY_FEE=1_000_000):
+    try: 
+        client = Client(d.helius_key)
+        temporal_url = tk.east_key
+        KEY = Keypair.from_base58_string(d.sol_key)
+        print(f"🌙 MoonDev's Keypair loaded! Public Key: {KEY.pubkey()}")
+
+        for i in range(loop_count):
+            print(f"\n🔄 Starting transaction {i+1}/{loop_count}...")
+            quote_url = f'https://quote-api.jup.ag/v6/quote?inputMint={USDC_TOKEN}&outputMint={token_address}&amount={amount}'
+
+            quote = requests.get(quote_url).json()
+            print(f"📊 Expected output: {quote.get('outAmount', 'Unknown')} tokens")
+            print(f"🔍 Quote details: {json.dumps(quote, indent=2)}")
+
+            swap_data = {
+                "quoteResponse": quote,
+                "userPublicKey": str(KEY.pubkey()),
+                "prioritizationFeeLamports": PRIORITY_FEE,
+                "dynamicSlippage": {"minBps": 50, "maxBps": slippage}
+            }
+
+            swap_ixs = requests.post(SWAP_IXS_URL, headers={"Content-Type": "application/json"}, json=swap_data).json()
+            instructions = [
+                Instruction(
+                    program_id=Pubkey.from_string(ix["programId"]),
+                    accounts=[
+                        AccountMeta(pubkey=Pubkey.from_string(account["pubkey"]), is_signer=account["isSigner"], is_writable=account["isWritable"])
+                        for account in ix["accounts"]
+                    ],
+                    data=base64.b64decode(ix["data"]),
+                )
+                for ix in (
+                    swap_ixs["setupInstructions"] + [swap_ixs["swapInstruction"]] + [swap_ixs["cleanupInstruction"]]
+                )
+            ]
+
+            recent_blockhash = client.get_latest_blockhash(commitment="finalized").value.blockhash
+            address_lookup_tables = load_address_lookup_tables(client, [Pubkey.from_string(address) for address in swap_ixs["addressLookupTableAccounts"]])
+            message = MessageV0.try_compile(
+                payer=KEY.pubkey(),
+                recent_blockhash=recent_blockhash,
+                instructions=instructions,
+                address_lookup_table_accounts=address_lookup_tables
+            )
+            tx = VersionedTransaction(message=message, signers=[KEY])
+            encoded_tx = base64.b64encode(bytes(tx)).decode('utf-8')
+            print(f"📝 Encoded transaction length: {len(encoded_tx)}")
+
+            response = requests.post(
+                temporal_url,
+                headers={"Content-Type": "application/json"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "sendTransaction",
+                    "params": [
+                        encoded_tx,
+                        {
+                            "encoding": "base64",
+                            "skipPreflight": True,
+                            "maxRetries": 1,
+                            "preflightCommitment": "processed"
+                        }
+                    ]
+                }
+            ).json()
+
+            if "result" in response:
+                print(f"\n✨ Transaction {i+1} successful!")
+                print(f"🔍 Transaction: https://solscan.io/tx/{response['result']}")
+            else:
+                print(f"\n❌ Transaction {i+1} failed: {response.get('error', 'Unknown error')}")
+                return
+
+    except Exception as e:
+        print(f"❌ Error occurred:")
+        print(f"Type: {type(e).__name__}")
+        print(f"Details: {str(e)}")
+        print("Stack trace:")
+        import traceback
+        traceback.print_exc()
+        return
 
 def temporal_market_buy(token_address, loop_count=1, amount=1_000_000, slippage=50, PRIORITY_FEE=1000000):
     """
@@ -94,6 +207,17 @@ def temporal_market_buy(token_address, loop_count=1, amount=1_000_000, slippage=
             print("🔄 Decoding Jupiter transaction...")
             swap_tx_data = base64.b64decode(tx_response['swapTransaction'])
             jupiter_tx = VersionedTransaction.from_bytes(swap_tx_data)
+
+
+            jup_tx_message = jupiter_tx.message
+            tip_ix = transfer(TransferParams(from_pubkey=KEY.pubkey(), to_pubkey=NOZOMI_TIP, lamports=MIN_TIP_AMOUNT))
+            compiled_tip_ix = jup_tx_message.compile_instruction(tip_ix)
+            jup_tx_message.instructions.append(compiled_tip_ix)
+
+            ixs = jup_tx_message.instructions + [compiled_tip_ix]
+
+            rebuilt_tx = Message.new_with_compiled_instructions(jup_tx_message.)
+
             print(f"📦 Jupiter transaction decoded, contains {len(jupiter_tx.message.instructions)} instructions")
 
             # Convert CompiledInstructions to regular Instructions
